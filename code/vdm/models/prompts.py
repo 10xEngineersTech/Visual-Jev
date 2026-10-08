@@ -28,17 +28,28 @@ CLAIM_OPTIONS = [
 ]
 
 
-def prefix_text(shared_context: str = "") -> str:
-    """System turn + user turn opener + the image + any public context.
+def prefix_text(shared_context: str = "", media: str = "image") -> str:
+    """System turn + user turn opener + the image or video + any public context.
 
-    The image and the shared context are the only things every question in a
-    batch has in common, so the prefix ends immediately after them.
+    The visual input and the shared context are the only things every question
+    in a batch has in common, so the prefix ends immediately after them.
+
+    For a video, the processor expands a single `<|video_pad|>` placeholder
+    into one timestamped `<|vision_start|>...<|vision_end|>` block per frame
+    on its own, so it must not be wrapped in vision tokens here the way the
+    image placeholder is -- that would double up the markers.
     """
     ctx = f"\n{shared_context.strip()}" if shared_context.strip() else ""
+    if media == "image":
+        visual = "<|vision_start|><|image_pad|><|vision_end|>"
+    elif media == "video":
+        visual = "<|video_pad|>"
+    else:
+        raise ValueError(f"media must be 'image' or 'video', got {media!r}")
     return (
         f"<|im_start|>system\n{SYSTEM}<|im_end|>\n"
         f"<|im_start|>user\n"
-        f"<|vision_start|><|image_pad|><|vision_end|>{ctx}"
+        f"{visual}{ctx}"
     )
 
 

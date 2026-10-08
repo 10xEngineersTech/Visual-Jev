@@ -26,3 +26,7 @@ matplotlib==3.10.9
 datasets==5.0.1
 pandas==2.3.3
 pyarrow==25.0.1
+
+# Decodes a raw video path or URL for --video; transformers 5.17.0 reaches for
+# this by default and only falls back to torchvision's now-removed video API.
+torchcodec

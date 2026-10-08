@@ -25,13 +25,21 @@ how well that holds numerically.
 
 Qwen3-VL specifics that shape this implementation:
 * DeepStack re-injects visual features into *text* layers 0..2, but only at
-  image-token positions, which all live in the shared prefix.  The prefix KV
-  therefore captures the whole DeepStack contribution and suffix forwards must
-  pass `deepstack_visual_embeds=None`.
-* M-RoPE position ids are 3-D and image tokens consume a 2-D span, so suffix
-  position ids cannot be derived from a token count.  We compute them once for
-  the full sequence with `get_rope_index` and slice, which keeps the shared and
-  independent paths on identical positions.
+  image- or video-token positions, which all live in the shared prefix.  The
+  prefix KV therefore captures the whole DeepStack contribution and suffix
+  forwards must pass `deepstack_visual_embeds=None`.
+* M-RoPE position ids are 3-D and visual tokens consume a 2-D (image) or
+  per-frame (video) span, so suffix position ids cannot be derived from a
+  token count.  We compute them once for the full sequence with
+  `get_rope_index` and slice, which keeps the shared and independent paths on
+  identical positions.
+
+Media
+-----
+A `PreparedGroup` holds exactly one image *or* one video as its shared visual
+context -- never both.  `media` names which one, and `vision_source` /
+`media_token_id` read off the right pair of tensors so the four execution
+paths below do not need to branch on it themselves.
 """
 from __future__ import annotations
 
@@ -62,16 +70,20 @@ CLAIM_CLASSES = 3
 # --------------------------------------------------------------------------- #
 @dataclasses.dataclass
 class PreparedGroup:
-    """One image + shared context, with N questions hanging off it."""
+    """One image or video + shared context, with N questions hanging off it."""
 
     prefix_ids: torch.Tensor                 # [P]
     suffix_ids: list[torch.Tensor]           # N x [S_i]
-    pixel_values: torch.Tensor
-    image_grid_thw: torch.Tensor
+    media: str                               # "image" | "video"
     position_ids: list[torch.Tensor]         # N x [3, P+S_i]
     qtypes: list[str]
     n_options: list[int]
     image_token_id: int
+    video_token_id: int
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    pixel_values_videos: torch.Tensor | None = None
+    video_grid_thw: torch.Tensor | None = None
 
     @property
     def n_questions(self) -> int:
@@ -80,6 +92,17 @@ class PreparedGroup:
     @property
     def prefix_len(self) -> int:
         return int(self.prefix_ids.shape[0])
+
+    @property
+    def media_token_id(self) -> int:
+        return self.image_token_id if self.media == "image" else self.video_token_id
+
+    @property
+    def vision_source(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (pixel values, grid shape) pair for whichever media this group holds."""
+        if self.media == "image":
+            return self.pixel_values, self.image_grid_thw
+        return self.pixel_values_videos, self.video_grid_thw
 
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +157,7 @@ class VDM(nn.Module):
         hidden = self.config.text_config.hidden_size
         self.heads = DecisionHeads(hidden).to(device=device, dtype=torch.float32) if with_heads else None
         self.image_token_id = self.config.image_token_id
+        self.video_token_id = self.config.video_token_id
         # only the answer-SFT baseline needs the full vocabulary head output
         self.keep_full_lm_logits = False
         self._option_ids = self._build_option_ids()
@@ -183,22 +207,41 @@ class VDM(nn.Module):
     # ------------------------------ preparation ---------------------------- #
     def prepare_group(
         self,
-        image,
-        questions: Sequence[dict],
+        image=None,
+        questions: Sequence[dict] | None = None,
         shared_context: str = "",
+        *,
+        video=None,
     ) -> PreparedGroup:
-        """Tokenize one image with N questions into a prefix + N suffixes.
+        """Tokenize one image or video with N questions into a prefix + N suffixes.
 
+        Exactly one of `image` (a PIL image) or `video` (a path or URL the
+        processor's video loader can read) must be given; it is the shared
+        visual context every question in `questions` is scored against.
         `questions` entries need `instruction`, `candidates` (or qtype "claim")
         and `qtype`.
         """
-        pre_txt = prefix_text(shared_context)
-        # The processor expands <|image_pad|> to the real number of visual
-        # tokens; we run it on the prefix text alone so the expansion is shared.
-        enc = self.processor(text=[pre_txt], images=[image], return_tensors="pt")
+        if questions is None:
+            raise ValueError("questions is required")
+        if (image is None) == (video is None):
+            raise ValueError("prepare_group takes exactly one of image or video")
+        media = "image" if image is not None else "video"
+
+        pre_txt = prefix_text(shared_context, media=media)
+        if media == "image":
+            # The processor expands <|image_pad|> to the real number of visual
+            # tokens; we run it on the prefix text alone so the expansion is shared.
+            enc = self.processor(text=[pre_txt], images=[image], return_tensors="pt")
+            pixel_values, image_grid_thw = enc["pixel_values"], enc["image_grid_thw"]
+            pixel_values_videos, video_grid_thw = None, None
+        else:
+            # Likewise for <|video_pad|>, which the processor expands into one
+            # timestamped block per frame on its own.
+            enc = self.processor(text=[pre_txt], videos=[video], return_tensors="pt")
+            pixel_values_videos, video_grid_thw = enc["pixel_values_videos"], enc["video_grid_thw"]
+            pixel_values, image_grid_thw = None, None
         prefix_ids = enc["input_ids"][0]
-        pixel_values = enc["pixel_values"]
-        image_grid_thw = enc["image_grid_thw"]
+        media_token_id = self.image_token_id if media == "image" else self.video_token_id
 
         suffix_ids: list[torch.Tensor] = []
         position_ids: list[torch.Tensor] = []
@@ -215,43 +258,85 @@ class VDM(nn.Module):
             n_options.append(len(opts))
 
             full = torch.cat([prefix_ids, suffix_ids[-1]])[None]           # [1, P+S]
-            mm = (full == self.image_token_id).to(torch.int32)
+            mm = self._mm_token_type_ids(full, media_token_id, media)
             pos, _ = self.vl_model.get_rope_index(
                 full.to(self.device_str),
                 mm_token_type_ids=mm.to(self.device_str),
-                image_grid_thw=image_grid_thw.to(self.device_str),
+                image_grid_thw=image_grid_thw.to(self.device_str) if image_grid_thw is not None else None,
+                video_grid_thw=video_grid_thw.to(self.device_str) if video_grid_thw is not None else None,
             )
             position_ids.append(pos[:, 0])                                  # [3, P+S]
 
         return PreparedGroup(
             prefix_ids=prefix_ids,
             suffix_ids=suffix_ids,
+            media=media,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
             position_ids=position_ids,
             qtypes=qtypes,
             n_options=n_options,
             image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
         )
 
     # ------------------------------ vision --------------------------------- #
-    def encode_vision(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor):
-        out = self.vl_model.get_image_features(
-            pixel_values.to(self.device_str, self.dtype),
-            image_grid_thw.to(self.device_str),
-            return_dict=True,
-        )
-        image_embeds = torch.cat(out.pooler_output, dim=0)
-        return image_embeds, out.deepstack_features
+    def encode_vision(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, media: str = "image"):
+        """Run the vision tower once over `pixel_values`/`grid_thw`.
 
-    def _embed(self, ids: torch.Tensor, image_embeds: torch.Tensor | None):
-        """Token embeddings with visual embeddings scattered into image slots."""
+        The same underlying encoder serves images and video frames; only the
+        grid tensor's source and the model method name differ.
+        """
+        if media == "image":
+            out = self.vl_model.get_image_features(
+                pixel_values.to(self.device_str, self.dtype),
+                grid_thw.to(self.device_str),
+                return_dict=True,
+            )
+        elif media == "video":
+            out = self.vl_model.get_video_features(
+                pixel_values.to(self.device_str, self.dtype),
+                grid_thw.to(self.device_str),
+                return_dict=True,
+            )
+        else:
+            raise ValueError(f"media must be 'image' or 'video', got {media!r}")
+        media_embeds = torch.cat(out.pooler_output, dim=0)
+        return media_embeds, out.deepstack_features
+
+    def _embed(self, ids: torch.Tensor, media_embeds: torch.Tensor | None, media_token_id: int | None = None):
+        """Token embeddings with visual embeddings scattered into image or video slots."""
+        if media_token_id is None:
+            media_token_id = self.image_token_id
         emb = self.vl_model.get_input_embeddings()(ids)
-        mask = ids == self.image_token_id
-        if image_embeds is not None and mask.any():
+        mask = ids == media_token_id
+        if media_embeds is not None and mask.any():
             emb = emb.clone()
-            emb[mask] = image_embeds.to(emb.dtype)
+            emb[mask] = media_embeds.to(emb.dtype)
         return emb, mask
+
+    @staticmethod
+    def _mm_token_type_ids(ids: torch.Tensor, media_token_id: int, media: str) -> torch.Tensor:
+        """`mm_token_type_ids` for `get_rope_index`/the backbone forward: text=0, image=1, video=2."""
+        value = 1 if media == "image" else 2
+        return (ids == media_token_id).to(torch.int32) * value
+
+    def _media_forward_kwargs(self, g: PreparedGroup, repeat: int = 1) -> dict[str, torch.Tensor]:
+        """Pixel values + grid shape keyed the way the backbone's forward expects,
+        for whichever media `g` holds. `repeat` copies them for
+        `run_independent_batch`, where the image or video really is
+        re-encoded once per row."""
+        px, grid = g.vision_source
+        px = px.to(self.device_str, self.dtype)
+        grid = grid.to(self.device_str)
+        if repeat != 1:
+            px = px.repeat(repeat, 1) if px.dim() == 2 else px.repeat(repeat, *([1] * (px.dim() - 1)))
+            grid = grid.repeat(repeat, 1)
+        if g.media == "image":
+            return {"pixel_values": px, "image_grid_thw": grid}
+        return {"pixel_values_videos": px, "video_grid_thw": grid}
 
     # ------------------------------ readout -------------------------------- #
     def _readout(self, hidden_last: torch.Tensor, qtypes: Sequence[str], n_options: Sequence[int]):
@@ -278,18 +363,18 @@ class VDM(nn.Module):
     # =============================== paths ================================= #
     @torch.no_grad()
     def run_independent(self, g: PreparedGroup) -> dict[str, torch.Tensor]:
-        """Full repeat: the image is re-encoded for every question."""
+        """Full repeat: the image or video is re-encoded for every question."""
         hs = []
+        media_kwargs = self._media_forward_kwargs(g)
         for i in range(g.n_questions):
             full = torch.cat([g.prefix_ids, g.suffix_ids[i]])[None].to(self.device_str)
-            mm = (full == self.image_token_id).to(torch.int32)
+            mm = self._mm_token_type_ids(full, g.media_token_id, g.media)
             out = self.vl_model(
                 input_ids=full,
-                pixel_values=g.pixel_values.to(self.device_str, self.dtype),
-                image_grid_thw=g.image_grid_thw.to(self.device_str),
                 mm_token_type_ids=mm,
                 position_ids=g.position_ids[i][:, None].to(self.device_str),
                 use_cache=False,
+                **media_kwargs,
             )
             hs.append(out.last_hidden_state[0, -1])
         return self._readout(torch.stack(hs), g.qtypes, g.n_options)
@@ -297,11 +382,11 @@ class VDM(nn.Module):
     @torch.no_grad()
     def run_vision_cache(self, g: PreparedGroup) -> dict[str, torch.Tensor]:
         """Vision encoder runs once; the language model still re-reads the prefix."""
-        image_embeds, deepstack = self.encode_vision(g.pixel_values, g.image_grid_thw)
+        media_embeds, deepstack = self.encode_vision(*g.vision_source, media=g.media)
         hs = []
         for i in range(g.n_questions):
             full = torch.cat([g.prefix_ids, g.suffix_ids[i]]).to(self.device_str)
-            emb, vmask = self._embed(full, image_embeds)
+            emb, vmask = self._embed(full, media_embeds, g.media_token_id)
             out = self.vl_model.language_model(
                 inputs_embeds=emb[None],
                 position_ids=g.position_ids[i][:, None].to(self.device_str),
@@ -335,22 +420,20 @@ class VDM(nn.Module):
         This is the control that separates the two things the shared path does
         at once. Against `run_independent` it isolates batching; against
         `run_prefix_share_batch`, which batches the same way, what remains is
-        the effect of sharing the prefix. The image really is re-encoded N
-        times here and the prefix really is recomputed on every row.
+        the effect of sharing the prefix. The image or video really is
+        re-encoded N times here and the prefix really is recomputed on every
+        row.
         """
         ids, pos, attn = self._pad_full(g)
         n = g.n_questions
-        px = g.pixel_values.to(self.device_str, self.dtype)
-        px = px.repeat(n, 1) if px.dim() == 2 else px.repeat(n, *([1] * (px.dim() - 1)))
-        grid = g.image_grid_thw.to(self.device_str).repeat(n, 1)
+        media_kwargs = self._media_forward_kwargs(g, repeat=n)
         out = self.vl_model(
             input_ids=ids.to(self.device_str),
-            pixel_values=px,
-            image_grid_thw=grid,
-            mm_token_type_ids=(ids == self.image_token_id).to(torch.int32).to(self.device_str),
+            mm_token_type_ids=self._mm_token_type_ids(ids, g.media_token_id, g.media).to(self.device_str),
             position_ids=pos.to(self.device_str),
             attention_mask=attn.to(self.device_str),
             use_cache=False,
+            **media_kwargs,
         )
         return self._readout(out.last_hidden_state[:, -1], g.qtypes, g.n_options)
 
@@ -358,15 +441,15 @@ class VDM(nn.Module):
     def run_vision_cache_batch(self, g: PreparedGroup) -> dict[str, torch.Tensor]:
         """Vision encoded once, language side still recomputed per question but
         batched. Isolates batching given visual reuse, without prefix sharing."""
-        image_embeds, deepstack = self.encode_vision(g.pixel_values, g.image_grid_thw)
+        media_embeds, deepstack = self.encode_vision(*g.vision_source, media=g.media)
         ids, pos, attn = self._pad_full(g)
         ids = ids.to(self.device_str)
         emb = self.vl_model.get_input_embeddings()(ids)
-        vmask = ids == self.image_token_id
-        n_img = int(vmask[0].sum())
+        vmask = ids == g.media_token_id
+        n_vis = int(vmask[0].sum())
         emb = emb.clone()
-        emb[vmask] = image_embeds[:n_img].repeat(g.n_questions, 1).to(emb.dtype)
-        ds = [d[:n_img].repeat(g.n_questions, 1) for d in deepstack] if deepstack else None
+        emb[vmask] = media_embeds[:n_vis].repeat(g.n_questions, 1).to(emb.dtype)
+        ds = [d[:n_vis].repeat(g.n_questions, 1) for d in deepstack] if deepstack else None
         out = self.vl_model.language_model(
             inputs_embeds=emb,
             position_ids=pos.to(self.device_str),
@@ -379,9 +462,9 @@ class VDM(nn.Module):
 
     @torch.no_grad()
     def _prefill_prefix(self, g: PreparedGroup):
-        image_embeds, deepstack = self.encode_vision(g.pixel_values, g.image_grid_thw)
+        media_embeds, deepstack = self.encode_vision(*g.vision_source, media=g.media)
         ids = g.prefix_ids.to(self.device_str)
-        emb, vmask = self._embed(ids, image_embeds)
+        emb, vmask = self._embed(ids, media_embeds, g.media_token_id)
         cache = DynamicCache()
         pos = g.position_ids[0][:, :g.prefix_len][:, None].to(self.device_str)
         self.vl_model.language_model(
@@ -418,7 +501,7 @@ class VDM(nn.Module):
         for i in range(g.n_questions):
             cache = self._fork(base, 1)
             ids = g.suffix_ids[i].to(self.device_str)
-            emb, _ = self._embed(ids, None)
+            emb, _ = self._embed(ids, None, g.media_token_id)
             pos = g.position_ids[i][:, g.prefix_len :][:, None].to(self.device_str)
             out = self.vl_model.language_model(
                 inputs_embeds=emb[None],
@@ -453,7 +536,7 @@ class VDM(nn.Module):
             attn[i, P + S - L :] = 1
 
         cache = self._fork(base, n)
-        emb, _ = self._embed(ids.to(self.device_str), None)
+        emb, _ = self._embed(ids.to(self.device_str), None, g.media_token_id)
         out = self.vl_model.language_model(
             inputs_embeds=emb,
             position_ids=pos.to(self.device_str),

@@ -46,6 +46,14 @@ python code/examples/quickstart.py \
 
 The shared image and `state` are cached once, then reused by the parallel questions. The demo includes an `incorrect_question` choice for false premises; it catches the dog/person mismatch with 0.966 probability. This runner supports `choice` questions with 2–16 options. It downloads the 4B base and adapter on first use; lower `--max-pixels` if Mac memory is tight.
 
+`--video` works the same way, in place of `--image`, scoring choices against a video instead:
+
+```bash
+python code/examples/quickstart.py --video /path/to/clip.mp4 \
+    --question "What animal appears in the video?" \
+    --choices cat dog bird other --device mps
+```
+
 
 ## Results at a glance
 
