@@ -13,14 +13,30 @@ Run from the repository root:
 `--fps 1` each window is a single frame and the image path is used; otherwise
 the frames are passed to the video path, so the prompt is built once per window
 and every question is answered from the same shared visual context.
+
+Outputs, all under `--out`:
+
+    sec_0000.json ...  one record per scored second
+    summary.json       the same records as one list
+    overlay.mp4        the source video re-encoded with each second's answers
+                       drawn over it (`--out-video` moves it elsewhere)
+
+While it runs, progress and log lines go to stderr: a tqdm bar tracks the
+seconds being scored and the frames being re-encoded into the overlay, and log
+lines report device selection, model download/load, adapter attach, and every
+second's decision. tqdm arrives with transformers, so it is already installed
+wherever this script can run.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
+
+from tqdm import tqdm
 
 # The dashcam questions from the Colab prototype: what to do next, and whether
 # anything is directly ahead in this lane.
@@ -36,6 +52,50 @@ DRIVING_QUESTIONS = {
         "criteria": {"yes": None, "no": None},
     },
 }
+
+
+log = logging.getLogger("video_per_second")
+
+
+class _TqdmHandler(logging.StreamHandler):
+    """Write log lines through `tqdm.write` so they never smear a live bar."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record), file=self.stream)
+        except Exception:  # logging must not raise into the caller
+            self.handleError(record)
+
+
+def configure_logging() -> None:
+    """Timestamped INFO lines on stderr, interleaved cleanly with the bars."""
+    handler = _TqdmHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                                           datefmt="%H:%M:%S"))
+    log.setLevel(logging.INFO)
+    log.handlers = [handler]
+    log.propagate = False
+
+
+def open_video(path: str):
+    """A cv2 capture for `path`, or a readable exit if it will not open."""
+    import cv2
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise SystemExit(f"could not open video: {path}")
+    return cap
+
+
+def video_info(path: str) -> tuple[float, int]:
+    """(source fps, frame count) read from the container; the count is 0 if unknown."""
+    import cv2
+
+    cap = open_video(path)
+    try:
+        return cap.get(cv2.CAP_PROP_FPS) or 30.0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
 
 
 def build_question(instructions: str, criteria: dict):
@@ -63,6 +123,15 @@ def questions_from_spec(spec: dict):
     return qids, questions, option_lists
 
 
+def sample_step(src_fps: float, frames_per_second: float) -> int:
+    """Keep every `step`-th frame -- the single place sampling density is decided.
+
+    Read by both the window iterator and the progress-bar total, so the bar
+    counts exactly the windows the iterator will yield.
+    """
+    return max(1, round(src_fps / frames_per_second))
+
+
 def iter_second_windows(path: str, frames_per_second: float):
     """Yield (second_index, [rgb frames]) for every whole second of the video.
 
@@ -72,11 +141,9 @@ def iter_second_windows(path: str, frames_per_second: float):
     """
     import cv2
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise SystemExit(f"could not open video: {path}")
+    cap = open_video(path)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    step = max(1, round(src_fps / frames_per_second))
+    step = sample_step(src_fps, frames_per_second)
     window: list = []
     second, idx = 0, 0
     try:
@@ -123,10 +190,91 @@ def score_window(model, frames, questions, option_lists, qids) -> dict:
     return results
 
 
+def draw_answers(frame, record: dict, qids) -> None:
+    """Draw one second's answers into the top-left corner of a BGR frame, in place.
+
+    The panel is a darkened rectangle so white-on-road stays readable at any
+    resolution; the first line carries the timing, the rest one answer each.
+    """
+    import cv2
+
+    lines = [f"{record['second']}s  {record['n_frames']}f  {record['latency_s'] * 1000:.0f} ms"]
+    for qid in qids:
+        result = record["results"][qid]
+        prediction = result["prediction"]
+        lines.append(f"{qid}: {prediction} ({result['probabilities'][prediction]:.2f})")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(1.2, max(0.5, frame.shape[0] / 360 * 0.7))
+    thickness = max(1, round(scale * 2))
+    line_h = int(round(scale * 30))
+    pad = int(round(scale * 8))
+
+    panel_w = min(frame.shape[1],
+                  max(cv2.getTextSize(line, font, scale, thickness)[0][0] for line in lines) + 2 * pad)
+    panel_h = min(frame.shape[0], line_h * len(lines) + pad)
+    panel = frame[:panel_h, :panel_w]
+    panel[:] = (panel * 0.4).astype(panel.dtype)
+
+    baseline = pad + int(round(line_h * 0.75))
+    for i, line in enumerate(lines):
+        color = (255, 255, 255) if i == 0 else (0, 255, 255)  # BGR: white header, yellow answers
+        cv2.putText(frame, line, (pad, baseline + i * line_h), font, scale, color, thickness,
+                    cv2.LINE_AA)
+
+
+def write_overlay_video(src_path: str, records: list[dict], out_path: str, qids) -> int:
+    """Re-encode `src_path` with every second's answers drawn over the frames.
+
+    A second sequential pass at the source frame rate, stopping after the last
+    scored second, so a run cut short by `--limit-seconds` yields a
+    correspondingly short video. `records` is already in memory, so the pass
+    holds nothing but the frame it is drawing on; the extra decode costs far
+    less than the inference that produced the records. Returns frames written.
+    """
+    import cv2
+
+    by_second = {record["second"]: record for record in records}
+    last_second = max(by_second)
+    cap = open_video(src_path)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        src_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+        if not writer.isOpened():
+            raise SystemExit(f"could not open a video writer for: {out_path}")
+        total = min(src_frames, int(round((last_second + 1) * fps))) if src_frames else None
+        written, idx = 0, 0
+        try:
+            with tqdm(total=total, desc="overlay", unit="f") as bar:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    second = int(idx / fps)
+                    if second > last_second:
+                        break
+                    record = by_second.get(second)
+                    if record is not None:
+                        draw_answers(frame, record, qids)
+                    writer.write(frame)
+                    written += 1
+                    idx += 1
+                    bar.update(1)
+        finally:
+            writer.release()
+    finally:
+        cap.release()
+    return written
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True, help="path to a local video")
     parser.add_argument("--out", required=True, help="directory for the per-second JSON files")
+    parser.add_argument("--out-video", default="",
+                        help="path for the annotated video (default: <out>/overlay.mp4)")
     parser.add_argument("--fps", type=float, default=2.0,
                         help="frames sampled per 1-second window (1 uses the image path)")
     parser.add_argument("--limit-seconds", type=int, default=0,
@@ -139,8 +287,25 @@ def main() -> None:
                         help="image pixel budget; lower it if unified memory is tight")
     args = parser.parse_args()
 
+    configure_logging()
     if args.fps <= 0:
         parser.error("--fps must be positive")
+
+    # Read the container up front: a bad path fails before the model download,
+    # and the frame count is what makes the progress bar determinate.
+    src_fps, src_frames = video_info(args.video)
+    if src_frames:
+        # Bucket the frames the reader will keep, without decoding: `--fps`
+        # below the source rate can leave a second with no sampled frame.
+        step = sample_step(src_fps, args.fps)
+        total_seconds = len({int(idx / src_fps) for idx in range(0, src_frames, step)})
+    else:
+        total_seconds = None
+    if args.limit_seconds:
+        total_seconds = (args.limit_seconds if total_seconds is None
+                         else min(total_seconds, args.limit_seconds))
+    log.info("video %s: %d frames @ %.3g fps%s", args.video, src_frames, src_fps,
+             "" if not src_frames else f" ({src_frames / src_fps:.1f}s)")
 
     if sys.platform == "darwin":
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -158,48 +323,66 @@ def main() -> None:
             device = "mps"
         else:
             device = "cpu"
+        log.info("--device auto resolved to %s", device)
     if device == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA was requested, but this PyTorch installation has no available CUDA device")
     if device == "mps" and not torch.backends.mps.is_available():
         parser.error("MPS was requested, but Apple MPS is not available in this PyTorch installation")
     dtype = torch.float16 if device == "mps" else torch.bfloat16
 
+    log.info("loading %s on %s with %s (the first run downloads the weights)",
+             args.model, device, dtype)
+    t_load = time.time()
     model = VDM(args.model, device=device, dtype=dtype, with_heads=False)
-    print(f"Using {device} with {dtype}")
     model.processor.image_processor.max_pixels = args.max_pixels
     model.backbone = PeftModel.from_pretrained(model.backbone, args.adapter).eval()
+    log.info("model + adapter %s ready in %.1fs (max_pixels=%d)",
+             args.adapter, time.time() - t_load, args.max_pixels)
 
     qids, questions, option_lists = questions_from_spec(DRIVING_QUESTIONS)
+    log.info("asking %s once per second", ", ".join(qids))
 
     os.makedirs(args.out, exist_ok=True)
+    log.info("writing per-second records to %s", args.out)
     summary = []
     t_start = time.time()
-    for sec, frames in iter_second_windows(args.video, args.fps):
-        if args.limit_seconds and len(summary) >= args.limit_seconds:
-            break
-        t0 = time.time()
-        results = score_window(model, frames, questions, option_lists, qids)
-        elapsed = time.time() - t0
-        record = {
-            "video": args.video,
-            "second": sec,
-            "start_s": float(sec),
-            "end_s": float(sec + 1),
-            "n_frames": len(frames),
-            "device": device,
-            "latency_s": round(elapsed, 3),
-            "results": results,
-        }
-        with open(os.path.join(args.out, f"sec_{sec:04d}.json"), "w", encoding="utf-8") as fh:
-            json.dump(record, fh, indent=2)
-        summary.append(record)
-        print(f"[{sec:>4}s] {len(frames)}f  {elapsed * 1000:6.0f} ms  "
-              + "  ".join(f"{q}={results[q]['prediction']}" for q in qids), flush=True)
+    with tqdm(total=total_seconds, desc="scoring", unit="win") as bar:
+        for sec, frames in iter_second_windows(args.video, args.fps):
+            if args.limit_seconds and len(summary) >= args.limit_seconds:
+                break
+            t0 = time.time()
+            results = score_window(model, frames, questions, option_lists, qids)
+            elapsed = time.time() - t0
+            record = {
+                "video": args.video,
+                "second": sec,
+                "start_s": float(sec),
+                "end_s": float(sec + 1),
+                "n_frames": len(frames),
+                "device": device,
+                "latency_s": round(elapsed, 3),
+                "results": results,
+            }
+            with open(os.path.join(args.out, f"sec_{sec:04d}.json"), "w", encoding="utf-8") as fh:
+                json.dump(record, fh, indent=2)
+            summary.append(record)
+            bar.update(1)
+            log.info("[%4ds] %df  %6.0f ms  %s", sec, len(frames), elapsed * 1000,
+                     "  ".join(f"{q}={results[q]['prediction']}" for q in qids))
 
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
-    print(f"wrote {len(summary)} per-second files + summary.json -> {args.out} "
-          f"({time.time() - t_start:.0f}s total)")
+    log.info("wrote %d per-second files + summary.json -> %s (%.0fs total)",
+             len(summary), args.out, time.time() - t_start)
+
+    if not summary:
+        log.warning("no second produced a window; nothing to overlay")
+        return
+    out_video = args.out_video or os.path.join(args.out, "overlay.mp4")
+    os.makedirs(os.path.dirname(os.path.abspath(out_video)), exist_ok=True)
+    log.info("writing the annotated video to %s", out_video)
+    frames_written = write_overlay_video(args.video, summary, out_video, qids)
+    log.info("wrote %s: %d frames at the source frame rate", out_video, frames_written)
 
 
 if __name__ == "__main__":
