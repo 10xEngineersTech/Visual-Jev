@@ -38,18 +38,88 @@ import time
 
 from tqdm import tqdm
 
-# The dashcam questions from the Colab prototype: what to do next, and whether
-# anything is directly ahead in this lane.
+# The dashcam question set, grouped the way a driver-assistance stack reads a
+# scene: the decision and its urgency first, then the forward-collision cues
+# behind it, the signals and signs that constrain it, and the conditions that
+# degrade it. Each question is one line in the overlay, so the panel grows with
+# this dict; drop entries here to trade coverage for latency and screen space.
+# Options with a description are rendered as "id: description" to disambiguate
+# them; the id alone is what lands in the JSON and on the overlay.
 DRIVING_QUESTIONS = {
+    # -- decision ----------------------------------------------------------
     "action": {
         "instructions": "What should the car do next?",
         "criteria": {"accelerate": None, "brake": None,
                      "change_lane": None, "maintain_speed": None},
     },
+    "warning_level": {
+        "instructions": "How urgently should the driver be warned about a hazard right now?",
+        "criteria": {"none": "no hazard needing attention",
+                     "caution": "a developing hazard the driver should watch",
+                     "urgent": "an imminent hazard requiring immediate action"},
+    },
+    # -- forward collision ---------------------------------------------------
     "obstacle_present": {
         "instructions": "Is there an obstacle (vehicle, pedestrian, or object) "
                         "directly ahead in this lane?",
         "criteria": {"yes": None, "no": None},
+    },
+    "lead_vehicle_gap": {
+        "instructions": "How far ahead is the nearest vehicle in this lane?",
+        "criteria": {"none": "no vehicle ahead in this lane",
+                     "far": "a comfortable following distance",
+                     "close": "closer than a safe following distance",
+                     "very_close": "a collision is likely without braking"},
+    },
+    "lead_vehicle_braking": {
+        "instructions": "Are the brake lights of the vehicle directly ahead turned on?",
+        "criteria": {"yes": None, "no": None, "no_vehicle": None},
+    },
+    "vehicle_cut_in": {
+        "instructions": "Is a vehicle from an adjacent lane merging or cutting into this lane ahead?",
+        "criteria": {"yes": None, "no": None},
+    },
+    "vulnerable_road_user": {
+        "instructions": "Where is the nearest pedestrian, cyclist, or motorcyclist?",
+        "criteria": {"none": "none visible",
+                     "roadside": "on the sidewalk or shoulder, not in the path",
+                     "in_path": "in or entering the car's path"},
+    },
+    "emergency_vehicle": {
+        "instructions": "Is there an emergency vehicle (ambulance, fire truck, or police car) "
+                        "with flashing lights?",
+        "criteria": {"yes": None, "no": None},
+    },
+    # -- signals, signs, and lane -------------------------------------------
+    "traffic_light": {
+        "instructions": "What color is the traffic light that controls this lane?",
+        "criteria": {"none": "no traffic light applies", "red": None,
+                     "yellow": None, "green": None},
+    },
+    "traffic_sign": {
+        "instructions": "Which traffic sign facing the car is most relevant right now?",
+        "criteria": {"none": None, "stop": None, "yield": None, "speed_limit": None,
+                     "pedestrian_crossing": None, "other": None},
+    },
+    "lane_position": {
+        "instructions": "Where is the car positioned within its lane?",
+        "criteria": {"centered": None, "drifting_left": None, "drifting_right": None},
+    },
+    "construction_zone": {
+        "instructions": "Is the car in or approaching a construction or work zone "
+                        "(cones, barriers, or workers)?",
+        "criteria": {"yes": None, "no": None},
+    },
+    # -- conditions ----------------------------------------------------------
+    "road_surface": {
+        "instructions": "What is the condition of the road surface?",
+        "criteria": {"dry": None, "wet": None, "snow_or_ice": None},
+    },
+    "visibility": {
+        "instructions": "How good is the visibility of the road ahead?",
+        "criteria": {"clear": None,
+                     "reduced": "rain, fog, dusk, or glare limits the view",
+                     "poor": "darkness or heavy weather hides the road ahead"},
     },
 }
 
@@ -194,33 +264,50 @@ def draw_answers(frame, record: dict, qids) -> None:
     """Draw one second's answers into the top-left corner of a BGR frame, in place.
 
     The panel is a darkened rectangle so white-on-road stays readable at any
-    resolution; the first line carries the timing, the rest one answer each.
+    resolution. The first row carries the timing; the answers below it flow
+    down as many columns as fit the frame width, so a long question set widens
+    the panel instead of letting it run down the frame.
     """
     import cv2
 
-    lines = [f"{record['second']}s  {record['n_frames']}f  {record['latency_s'] * 1000:.0f} ms"]
+    header = f"{record['second']}s  {record['n_frames']}f  {record['latency_s'] * 1000:.0f} ms"
+    answers = []
     for qid in qids:
         result = record["results"][qid]
         prediction = result["prediction"]
-        lines.append(f"{qid}: {prediction} ({result['probabilities'][prediction]:.2f})")
+        answers.append(f"{qid}: {prediction} {result['probabilities'][prediction]:.2f}")
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = min(1.2, max(0.5, frame.shape[0] / 360 * 0.7))
-    thickness = max(1, round(scale * 2))
-    line_h = int(round(scale * 30))
+    frame_h, frame_w = frame.shape[:2]
+    scale = min(0.8, max(0.35, min(frame_h, frame_w) / 360 * 0.3))
+    thickness = max(1, round(scale * 1.6))
     pad = int(round(scale * 8))
+    gap = int(round(scale * 24))  # between answer columns
 
-    panel_w = min(frame.shape[1],
-                  max(cv2.getTextSize(line, font, scale, thickness)[0][0] for line in lines) + 2 * pad)
-    panel_h = min(frame.shape[0], line_h * len(lines) + pad)
+    def text_w(line: str) -> int:
+        return cv2.getTextSize(line, font, scale, thickness)[0][0]
+
+    # Measured rather than fixed, so rows never touch whatever font cv2 renders.
+    (_, glyph_h), descent = cv2.getTextSize("Ag_", font, scale, thickness)
+    line_h = glyph_h + descent + max(2, pad // 2)
+
+    col_w = max(map(text_w, answers)) + gap
+    n_cols = max(1, min(len(answers), (frame_w - 2 * pad + gap) // col_w))
+    n_rows = -(-len(answers) // n_cols)
+    n_cols = -(-len(answers) // n_rows)  # rebalance so the last column is not near-empty
+
+    panel_w = min(frame_w, max(text_w(header), n_cols * col_w - gap) + 2 * pad)
+    panel_h = min(frame_h, line_h * (n_rows + 1) + pad)
     panel = frame[:panel_h, :panel_w]
     panel[:] = (panel * 0.4).astype(panel.dtype)
 
-    baseline = pad + int(round(line_h * 0.75))
-    for i, line in enumerate(lines):
-        color = (255, 255, 255) if i == 0 else (0, 255, 255)  # BGR: white header, yellow answers
-        cv2.putText(frame, line, (pad, baseline + i * line_h), font, scale, color, thickness,
-                    cv2.LINE_AA)
+    baseline = pad + glyph_h
+    cv2.putText(frame, header, (pad, baseline), font, scale, (255, 255, 255), thickness,
+                cv2.LINE_AA)  # BGR: white header, yellow answers
+    for i, line in enumerate(answers):
+        col, row = divmod(i, n_rows)
+        cv2.putText(frame, line, (pad + col * col_w, baseline + (row + 1) * line_h), font, scale,
+                    (0, 255, 255), thickness, cv2.LINE_AA)
 
 
 def write_overlay_video(src_path: str, records: list[dict], out_path: str, qids) -> int:
